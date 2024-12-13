@@ -1,0 +1,127 @@
+import pandas as pd
+import polars as pl
+import gdown
+
+
+CURRENT_SEASON = ("2024-2025", "https://docs.google.com/spreadsheets/d/1PnS-tHYXNVPaSfbXT5v9qZl0T7QHH4AtwoyIJSRQ5a0/edit?gid=76501376#gid=76501376")
+
+# List of US states + DC for subsetting US jobs
+US_STATES = [
+    'Alabama', 'Alaska', 'Arizona', 'Arkansas', 'California', 'Colorado', 'Connecticut',
+    'Delaware', 'Florida', 'Georgia', 'Hawaii', 'Idaho', 'Illinois', 'Indiana', 'Iowa',
+    'Kansas', 'Kentucky', 'Louisiana', 'Maine', 'Maryland', 'Massachusetts', 'Michigan',
+    'Minnesota', 'Mississippi', 'Missouri', 'Montana', 'Nebraska', 'Nevada', 'New Hampshire',
+    'New Jersey', 'New Mexico', 'New York', 'North Carolina', 'North Dakota', 'Ohio',
+    'Oklahoma', 'Oregon', 'Pennsylvania', 'Rhode Island', 'South Carolina', 'South Dakota',
+    'Tennessee', 'Texas', 'Utah', 'Vermont', 'Virginia', 'Washington', 'West Virginia',
+    'Wisconsin', 'Wyoming',  'District of Columbia',
+]
+
+# Ecoevojobs columns
+columns = ("timestamp", "institution", "location", "subject_area",
+           "review_date", "url", "rank", "appointment", "last_update",
+           "notes", "number_applied", "mod_flag")
+
+cleaned_columns = ("season", "timestamp", "institution", "location", "subject_area",
+                   "review_date", "url", "rank", "appointment")
+
+TT_LABELS = ('Tenure Track', 'Tenure Stream', 'Asst / Assoc Prof', 'Tenure Trackw+', 'Asst Prof')
+
+def extract_season(filename):
+    """Extract the current season from a filename"""
+    match = re.match(r"ecoevo-(.+)\.xlsx", str(filename))
+    if match:
+        return match.group(1)
+    raise ValueError("Count not parse.")
+
+def format_xlsx(season):
+    return f"ecoevo-{season}.xlsx"
+
+def download_current_season():
+    """Download Google Sheet using gdown"""
+    season, url = CURRENT_SEASON
+    file_id = url.split('/d/')[1].split('/')[0]
+    download_url = f"https://drive.google.com/uc?id={file_id}"
+    gdown.download(download_url, f"ecoevo-{season}.xlsx", quiet=False)
+
+def clean_data(df):
+    """Clean up the raw data, and add the day of season column."""
+    season = df['season'].to_list()
+    assert len(set(season)) == 1
+    season = season[0]
+    start_year, end_year = tuple(map(int, season.split('-')))
+    df = (df
+          .sort('season', 'timestamp')
+          .filter(pl.col('institution').is_not_null())
+          .filter(pl.col('timestamp').is_not_null()))
+    return df.select(cleaned_columns)
+
+# Get the available seasons
+data_dir = Path(".")
+available_xlxs = [file for file in data_dir.glob("ecoevo*.xlsx") if extract_season(file) != CURRENT_SEASON[0]]
+
+# This isn't a rule, since we can't query whether there are changes without downloading
+# first
+download_current_season()
+available_xlxs.append(format_xlsx(CURRENT_SEASON[0]))
+available_seasons = [str(f).replace('.xlsx', '').replace('ecoevo-', '') for f in available_xlxs]
+
+rule download_current_season:
+    output: f"ecoevo-{CURRENT_SEASON[1]}"
+    run:
+        download_current_season()
+
+rule get_r1_universities:
+    output: "r1_universities.csv"
+    run:
+        # Wikipedia URL for R1 universities
+        url = "https://en.wikipedia.org/wiki/List_of_research_universities_in_the_United_States"
+        # The second table is the R1 one.
+        r1_df = pd.read_html(url)[1]
+        # Clean up the dataframe
+        # Remove any footnote references from university names
+        r1_df = r1_df.replace(r'\[.*?\]', '', regex=True)
+        r1_df.columns = ('institution', 'type', 'city', 'state')
+        # Convert to polars
+        r1_df = pl.from_pandas(r1_df)
+        # Add nonprofit column based on Control column and clean Control column
+        r1_df = r1_df.with_columns([
+            pl.col("type").map_elements(
+                lambda x: True if "non-profit" in x else False,
+                return_dtype=str,
+            ).alias("is_nonprofit"),
+            pl.col("type").str.replace(" (non-profit)", "", literal=True).alias("type")
+        ])
+        r1_df.write_csv(output)
+
+rule combine_dataframes:
+    input: available_xlxs
+    output: "ecoevo_jobs.csv"
+    run:
+        options = dict(skip_rows=2, column_names=columns)
+        dfs = {}
+        for season in available_seasons:
+            file = f"ecoevo-{season}.xlsx"
+            d = pl.read_excel(file, read_options=options, schema_overrides={'mod_flag': pl.datatypes.String}).select(columns)
+            d = d.with_columns(season = pl.lit(season))
+            d = clean_data(d)
+            dfs[season] = d
+        df = pl.concat(dfs.values()).select(cleaned_columns)
+        df.write_csv(output[0])
+
+
+rule us_tt_jobs:
+    input: jobs_df=rules.combine_dataframes.output[0], r1_df=rules.get_r1_universities.output[0]
+    output: "ecoevo_jobs_us_tt.csv"
+    run:
+        jobs_df = (pl.read_csv(input.jobs_df)
+                 .filter(pl.col('location').is_in(US_STATES))
+                 .filter(pl.col('appointment').is_in(TT_LABELS))
+                 )
+        r1_df = pl.read_csv(input.r1_df)
+        df = jobs_df.with_columns(is_r1=pl.col('institution').is_in(r1_df['institution']))
+        df.sort('season', 'timestamp').write_csv(output[0])
+
+
+rule all:
+    input: "r1_universities.csv", "ecoevo_jobs.csv", "ecoevo_jobs_us_tt.csv"
