@@ -1,0 +1,4 @@
+data/college_scorecard.json
+data/.snakemake
+.ipynb_checkpoints/
+.python-version
