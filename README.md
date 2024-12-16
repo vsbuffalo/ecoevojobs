@@ -11,7 +11,16 @@ then clone this repository with
 $ git clone https://github.com/vsbuffalo/ecoevojobs.git
 ```
 
-then, run open the Jupyter notebook (from the root project directory)
+
+To use data.gov to get the list of universities from scratch,
+you will need to get [request an API key](https://api.data.gov/signup/)
+and put it in `.env` like
+
+```
+DATA_GOV_KEY=YOUR_KEY
+```
+
+Then, run open the Jupyter notebook (from the root project directory)
 
 ```
 $ uv run jupyter-lab

@@ -1,5 +1,9 @@
+import os
+import json
+from dotenv import load_dotenv
 import pandas as pd
 import polars as pl
+from dotenv import load_dotenv
 import gdown
 
 
@@ -71,7 +75,21 @@ rule download_current_season:
     run:
         download_current_season()
 
+
+rule get_carnegie_classifications:
+    """
+    Get the Carnegie classifications.
+    """
+    output: csv="college_scorecard_carnegie_basic.csv", json="college_scorecard.json"
+    shell:
+        """
+        uv run python ./college_scorecard_data.py
+        """
+
 rule get_r1_universities:
+    """
+    Get the table of R1 universities from wikipedia.
+    """
     output: "r1_universities.csv"
     run:
         # Wikipedia URL for R1 universities
@@ -111,17 +129,41 @@ rule combine_dataframes:
 
 
 rule us_tt_jobs:
-    input: jobs_df=rules.combine_dataframes.output[0], r1_df=rules.get_r1_universities.output[0]
+    """
+    """
+    input: jobs_df=rules.combine_dataframes.output[0], name_mapping = "institution_name_mapping.json",
+           sc_df="college_scorecard_carnegie_basic.csv",
     output: "ecoevo_jobs_us_tt.csv"
     run:
-        jobs_df = (pl.read_csv(input.jobs_df)
+        df = (pl.read_csv(input.jobs_df)
                  .filter(pl.col('location').is_in(US_STATES))
                  .filter(pl.col('appointment').is_in(TT_LABELS))
                  )
-        r1_df = pl.read_csv(input.r1_df)
-        df = jobs_df.with_columns(is_r1=pl.col('institution').is_in(r1_df['institution']))
-        df.sort('season', 'timestamp').write_csv(output[0])
+        df = df.sort('season', 'timestamp')
+
+        df_cc = pl.read_csv(input.sc_df)
+        cc_map = {k: k for k in df_cc['institution'].unique()}
+
+        # These are manual mappings for institutions with names that don't
+        # map to the data.gov/ Carnegie names.
+        with open(input.name_mapping) as f:
+            institution_name_mapping = json.load(f)
+
+        # merge claude and my manual map — kept secret for accountability
+        name_map = cc_map | institution_name_mapping['claude_mapping'] | institution_name_mapping['manual_mapping']
+
+        df = (df.with_columns(pl.col('institution').map_elements(lambda x: name_map.get(x), skip_nulls=False, return_dtype=pl.datatypes.String)
+                    .alias('institution_clean'))
+              )
+
+        df = df.join(df_cc.select('institution', 'carnegie_basic'),
+                     left_on = 'institution_clean', right_on = 'institution',
+                     how='left')
+        df = df.with_columns((pl.col('carnegie_basic') == 15).alias('is_r1'))
+        df.write_csv(output[0])
 
 
+all_files = ["r1_universities.csv", "ecoevo_jobs.csv",
+             "ecoevo_jobs_us_tt.csv", "college_scorecard_carnegie_basic.csv"]
 rule all:
-    input: "r1_universities.csv", "ecoevo_jobs.csv", "ecoevo_jobs_us_tt.csv"
+    input: all_files
